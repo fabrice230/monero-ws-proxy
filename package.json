@@ -1,0 +1,11 @@
+{
+  "name": "monero-randomx-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node proxy/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

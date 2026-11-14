@@ -42,7 +42,7 @@ wss.on('connection', (ws) => {
         if (msgStr) {
             try {
                 const parsed = JSON.parse(msgStr);
-                if (parsed.id === 0) return; // Ignore keep-alive
+                if (parsed.id === 0) return;
             } catch (e) {}
 
             tcpSocket.write(msgStr + '\n');

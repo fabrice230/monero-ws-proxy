@@ -4,7 +4,7 @@
 module.exports = {
   // Default donation wallet. Replace with your own monero address if you
   // want this demo to mine to your own payout.
-  WALLET:    '4AEm9oe64pUY2saKdCQfSrg5Xy5N8TgGcecM8qZhcri1FSWdvJ4mFAzhfS3my4Cca7dNyZea7BRb2KannBpRBY1yGytE5fv',
+  WALLET:    '4A8xTBWQKjdbzBHko5Tam8Yx4v3DenbkKg4ioQUAHYVUQzgH2Ji76rZHqp5hs47jVf56ijE6X3mYo2RtGNn84jvXCdz4Gwb',
   POOL_HOST: 'pool.supportxmr.com',
   POOL_PORT: 3333,
   WORKER_NAME: 'gh-distro',

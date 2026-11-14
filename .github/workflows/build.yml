@@ -1,8 +1,11 @@
 
 name: Build RandomX WebAssembly
 
-on:
+"on":
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   build:
@@ -40,3 +43,4 @@ jobs:
           path: |
             public/randomx.js
             public/randomx.wasm
+

@@ -1,110 +1,83 @@
-const http = require("http");
-const net = require("net");
-const WebSocket = require("ws");
+const http = require('http');
+const { WebSocketServer } = require('ws');
+const net = require('net');
 
-const PORT = Number(process.env.PORT) || 8080;
-const POOL_HOST = process.env.POOL_HOST || "gulf.moneroocean.stream";
-const POOL_PORT = Number(process.env.POOL_PORT) || 10128;
+const PORT = process.env.PORT || 10000;
+const POOL_HOST = 'gulf.moneroocean.stream';
+const POOL_PORT = 10128;
 
+// Serveur HTTP de base pour le health check de Render (évite les erreurs de déploiement)
 const server = http.createServer((req, res) => {
-  if (req.url === "/" || req.url === "/health") {
-    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({
-      status: "ok",
-      service: "monero-ws-proxy",
-      pool: `${POOL_HOST}:${POOL_PORT}`,
-      uptime: Math.floor(process.uptime())
-    }));
-    return;
-  }
-  res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-  res.end("Not found");
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Monero WebSocket Proxy is running!\n');
 });
 
-const wss = new WebSocket.Server({
-  server,
-  path: "/",
-  maxPayload: 1024 * 1024
-});
+const wss = new WebSocketServer({ server });
 
-wss.on("connection", (ws, req) => {
-  const remote = req.socket.remoteAddress || "unknown";
-  console.log(`[WS] Client connecté : ${remote}`);
+wss.on('connection', (ws) => {
+    console.log('[PROXY] Client WebSocket connecté.');
 
-  const tcp = net.createConnection({ host: POOL_HOST, port: POOL_PORT });
-  let tcpBuffer = "";
-  let closed = false;
+    const tcpSocket = new net.Socket();
+    let buffer = '';
 
-  const closeBoth = (code = 1011, reason = "Upstream connection closed") => {
-    if (closed) return;
-    closed = true;
-    if (ws.readyState === WebSocket.OPEN) ws.close(code, reason);
-    tcp.destroy();
-  };
-
-  tcp.setTimeout(20000);
-  tcp.on("connect", () => {
-    console.log(`[TCP] Connecté à ${POOL_HOST}:${POOL_PORT}`);
-    tcp.setTimeout(0);
-  });
-
-  tcp.on("data", chunk => {
-    if (ws.readyState !== WebSocket.OPEN) return;
-    // Le protocole Stratum utilise des messages JSON terminés par un saut de ligne.
-    tcpBuffer += chunk.toString("utf8");
-    if (tcpBuffer.length > 2 * 1024 * 1024) {
-      console.error("[TCP] Tampon trop volumineux, fermeture.");
-      closeBoth(1009, "Upstream buffer too large");
-      return;
-    }
-    // Le proxy retransmet le flux reçu. Le client découpe les lignes JSON.
-    ws.send(chunk, { binary: false }, err => {
-      if (err) console.error(`[WS SEND] ${err.message}`);
+    tcpSocket.connect(POOL_PORT, POOL_HOST, () => {
+        console.log(`[PROXY] Connecté au pool TCP ${POOL_HOST}:${POOL_PORT}`);
     });
-  });
 
-  ws.on("message", (data, isBinary) => {
-    if (isBinary) {
-      closeBoth(1003, "Text frames only");
-      return;
-    }
-    if (!tcp.destroyed && tcp.writable) {
-      tcp.write(data, err => {
-        if (err) console.error(`[TCP WRITE] ${err.message}`);
-      });
-    }
-  });
+    // Données reçues du pool TCP -> envoyées au WebSocket client
+    tcpSocket.on('data', (data) => {
+        buffer += data.toString('utf8');
+        let lines = buffer.split('\n');
+        buffer = lines.pop(); // Conserver le fragment de ligne incomplet dans le buffer
 
-  tcp.on("timeout", () => {
-    console.error("[TCP] Délai de connexion dépassé.");
-    closeBoth(1011, "Pool connection timeout");
-  });
-  tcp.on("error", err => {
-    console.error(`[TCP ERROR] ${err.message}`);
-    closeBoth(1011, "Pool connection error");
-  });
-  tcp.on("close", () => {
-    console.log("[TCP] Connexion pool fermée.");
-    if (!closed && ws.readyState === WebSocket.OPEN) ws.close(1011, "Pool disconnected");
-  });
-  ws.on("error", err => {
-    console.error(`[WS ERROR] ${err.message}`);
-    tcp.destroy();
-  });
-  ws.on("close", () => {
-    closed = true;
-    tcp.destroy();
-    console.log("[WS] Client déconnecté.");
-  });
+        for (let line of lines) {
+            if (line.trim()) {
+                if (ws.readyState === ws.OPEN) {
+                    ws.send(line.trim() + '\n');
+                }
+            }
+        }
+    });
+
+    // Messages reçus du WebSocket client -> envoyés au pool TCP
+    ws.on('message', (message) => {
+        const msgStr = message.toString().trim();
+        if (msgStr) {
+            // Ignore le keep-alive interne du client (id: 0) pour ne pas polluer le pool
+            try {
+                const parsed = JSON.parse(msgStr);
+                if (parsed.id === 0) return;
+            } catch (e) {}
+
+            tcpSocket.write(msgStr + '\n');
+        }
+    });
+
+    tcpSocket.on('error', (err) => {
+        console.error('[PROXY] Erreur socket TCP pool:', err.message);
+        if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({ error: { code: -1, message: 'TCP Pool Error: ' + err.message } }) + '\n');
+        }
+    });
+
+    tcpSocket.on('close', () => {
+        console.log('[PROXY] Connexion TCP pool fermée.');
+        if (ws.readyState === ws.OPEN) {
+            ws.close();
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('[PROXY] Client WebSocket déconnecté.');
+        tcpSocket.destroy();
+    });
+
+    ws.on('error', (err) => {
+        console.error('[PROXY] Erreur WebSocket:', err.message);
+        tcpSocket.destroy();
+    });
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[HTTP] Proxy prêt sur le port ${PORT}`);
-  console.log(`[POOL] Cible : ${POOL_HOST}:${POOL_PORT}`);
-});
-
-process.on("SIGTERM", () => {
-  console.log("[SYSTEM] SIGTERM reçu, arrêt propre.");
-  wss.close();
-  server.close(() => process.exit(0));
+server.listen(PORT, () => {
+    console.log(`[PROXY] Serveur démarré sur le port ${PORT}`);
 });

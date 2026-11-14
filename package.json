@@ -1,16 +1,11 @@
 {
   "name": "monero-ws-proxy",
-  "version": "1.1.0",
-  "private": true,
-  "description": "WebSocket to TCP relay for a MoneroOcean Stratum endpoint",
+  "version": "1.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "ws": "^8.18.0"
-  },
-  "engines": {
-    "node": ">=18"
+    "ws": "^8.16.0"
   }
 }

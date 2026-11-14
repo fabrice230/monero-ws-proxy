@@ -1,14 +1,32 @@
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const net = require('net');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 10000;
 const POOL_HOST = 'gulf.moneroocean.stream';
-const POOL_PORT = 10128;
+const POOL_PORT = 10032; // Port basse difficulté pour tester les shares
 
 const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Monero WebSocket Proxy is running!\n');
+    // EN-TÊTES CRITIQUES POUR WEBASSEMBLY / MULTITHREADING (SharedArrayBuffer)
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+
+    if (req.url === '/' || req.url === '/index.html') {
+        fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
+            if (err) {
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+                res.end('Erreur de chargement de index.html\n');
+            } else {
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(data);
+            }
+        });
+    } else {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Monero WebSocket Proxy & WASM Server is running!\n');
+    }
 });
 
 const wss = new WebSocketServer({ server });

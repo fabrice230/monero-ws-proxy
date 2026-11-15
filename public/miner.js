@@ -22,6 +22,13 @@ const state = {
 };
 
 const params = new URLSearchParams(location.search);
+
+// Mobile : mémoire limitée (iOS tue l'onglet très vite). On plafonne les
+// threads et on interdit le mode Full (~2,5 Go).
+const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
+  (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+const MAX_THREADS = isMobile ? 2 : 32;
+
 // No SharedArrayBuffer (the page is not crossOriginIsolated, or ?sab=0 forces
 // it for A/B): no pthreads, so mining runs as N single-thread workers on the
 // randomx_st build (NoSabPool below), each in JIT'd light mode with its own
@@ -30,9 +37,10 @@ const noSab = params.get('sab') === '0' || window.crossOriginIsolated !== true;
 // ?fb_full=K (0..2, no SAB only): K of those workers become full-dataset
 // replicas (a private ~2.3 GB dataset each), built cooperatively by all workers
 // (fb_full.js); a worker that can't allocate one stays in light mode.
-const fbFull = noSab ? Math.max(0, Math.min(2, Math.floor(Number(params.get('fb_full')) || 0))) : 0;
-// Safe browser default: use light mode. Opt into full mode with ?full=1.
-const fullMemory = !noSab && params.get('full') === '1' && params.get('light') !== '1';
+const fbFull = (noSab && !isMobile) ? Math.max(0, Math.min(2, Math.floor(Number(params.get('fb_full')) || 0))) : 0;
+// Safe browser default: use light mode. Opt into full mode with ?full=1
+// (jamais sur mobile).
+const fullMemory = !isMobile && !noSab && params.get('full') === '1' && params.get('light') !== '1';
 // JIT defaults: on for all engines. The threaded-interpreter + V2-minimal
 // (split_inner_dispatch) path landed in worker.js makes the JIT a clear win
 // everywhere — Safari 560 H/s, Chrome 530 H/s, Firefox 550+ at 32T on M4
@@ -50,15 +58,15 @@ const enableJit = jitDecision;
 const profileCore = params.get('profile') === '1';
 const requestedThreads = Number(params.get('threads'));
 const defaultThreads = fullMemory ? 32 : 1;
-let datasetThreads = Math.max(1, Math.min(32, requestedThreads || defaultThreads));
+let datasetThreads = Math.max(1, Math.min(MAX_THREADS, requestedThreads || defaultThreads));
 // Dataset init thread count is decoupled from mining threads. The em-pthread
 // pool is 32 (build.sh:PTHREAD_POOL_SIZE), per-item init is independent
 // compute on a read-mostly cache, so oversubscription on hardware threads
 // is safe and helps wall-clock when hardwareConcurrency<32. Users at
 // ?threads=1 used to wait ~150s for init on M4 Mini; now ~26s. Override
 // for benchmarking with ?init_threads=N.
-let datasetInitThreads = Math.max(1, Math.min(32,
-  Number(params.get('init_threads')) || 32));
+let datasetInitThreads = Math.max(1, Math.min(MAX_THREADS,
+  Number(params.get('init_threads')) || MAX_THREADS));
 
 const $ = (id) => document.getElementById(id);
 
@@ -189,6 +197,8 @@ function log(msg) {
   const line = document.createElement('div');
   line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
   el.appendChild(line);
+  // Limite la taille du journal (le nœud 0 est la bannière, on le garde).
+  while (el.childNodes.length > 150) el.removeChild(el.childNodes[1]);
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
 
@@ -462,6 +472,9 @@ function initWorker() {
   const vTag = (window.MINER_BUILD || 'dev').replace(/[^a-zA-Z0-9-]/g, '');
   state.worker = noSab ? new NoSabPool(datasetThreads, vTag, fbFull) : new Worker(`worker.js?v=${vTag}`);
   log(`build=${window.MINER_BUILD || '?'} (cside-jit split)`);
+  if (isMobile) {
+    log(`Mobile détecté : max ${MAX_THREADS} threads, mode Full désactivé`);
+  }
   if (noSab) {
     log(`No SharedArrayBuffer${params.get('sab') === '0' ? ' (forced by ?sab=0)' : ''}: ` +
         `${datasetThreads} single-thread light-mode workers (randomx_st, ~300 MB each)`);
@@ -647,11 +660,11 @@ function initWorker() {
 }
 
 // Reads the threads input (the only source of truth the user can edit) and
-// returns a clamped 1-32 integer.
+// returns a clamped 1-MAX_THREADS integer.
 function readDesiredThreads() {
   const inputEl = $('rebuildThreads');
   if (!inputEl) return datasetThreads;
-  return Math.max(1, Math.min(32, Math.floor(Number(inputEl.value) || 1)));
+  return Math.max(1, Math.min(MAX_THREADS, Math.floor(Number(inputEl.value) || 1)));
 }
 
 function toggle() {
@@ -704,7 +717,7 @@ function toggle() {
 }
 
 function hardRebuild(newThreads) {
-  const clamped = Math.max(1, Math.min(32, Math.floor(Number(newThreads) || 1)));
+  const clamped = Math.max(1, Math.min(MAX_THREADS, Math.floor(Number(newThreads) || 1)));
   datasetThreads = clamped;
 
   if (state.worker) {
@@ -742,6 +755,9 @@ $('toggle').addEventListener('click', toggle);
 
 const threadsInput = $('rebuildThreads');
 const miniThreadsInput = $('miniThreads');
+// Le plafond de threads s'applique aussi aux champs de saisie.
+if (threadsInput) threadsInput.max = String(MAX_THREADS);
+if (miniThreadsInput) miniThreadsInput.max = String(MAX_THREADS);
 if (threadsInput) {
   threadsInput.value = String(datasetThreads);
   $('rebuildBtn').addEventListener('click', () => {
@@ -844,18 +860,27 @@ if (workerInput) {
   });
 }
 
+function applyPreset(key) {
+  const preset = POOL_PRESETS[key];
+  if (preset && poolHostInput && poolPortInput) {
+    poolHostInput.value = preset.host;
+    poolPortInput.value = preset.port;
+    try {
+      localStorage.setItem(LS_POOL_HOST, preset.host);
+      localStorage.setItem(LS_POOL_PORT, preset.port);
+    } catch (_) {}
+    log(`Applied preset: ${key} (${preset.host}:${preset.port})`);
+  }
+}
+
 document.querySelectorAll('[data-preset]').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    const key = btn.getAttribute('data-preset');
-    const preset = POOL_PRESETS[key];
-    if (preset && poolHostInput && poolPortInput) {
-      poolHostInput.value = preset.host;
-      poolPortInput.value = preset.port;
-      try {
-        localStorage.setItem(LS_POOL_HOST, preset.host);
-        localStorage.setItem(LS_POOL_PORT, preset.port);
-      } catch (_) {}
-      log(`Applied preset: ${key} (${preset.host}:${preset.port})`);
-    }
-  });
+  btn.addEventListener('click', () => applyPreset(btn.getAttribute('data-preset')));
+});
+
+// index.html n'a pas d'attribut data-preset : on lie aussi les boutons par id.
+[['presetSupportxmr', 'supportxmr'], ['presetMoneroocean', 'moneroocean']].forEach(([id, key]) => {
+  const btn = $(id);
+  if (btn && !btn.hasAttribute('data-preset')) {
+    btn.addEventListener('click', () => applyPreset(key));
+  }
 });

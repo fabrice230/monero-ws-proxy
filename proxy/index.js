@@ -55,6 +55,8 @@ function createSession(tag, sendToClient, target = {}) {
   let minerId       = null;
   let pending       = [];
   let rewriteLogin  = true;
+  let poolFailureNotified = false;
+  const MAX_PENDING = 32;
   // Random per-session suffix on the worker name so multiple browser tabs
   // sharing this proxy don't collide on the pool side.
   const sessionUid  = Math.random().toString(36).slice(2, 8);
@@ -65,10 +67,31 @@ function createSession(tag, sendToClient, target = {}) {
   let workerOverride = null;
 
   function sendToPool(msg) {
-    if (!pool) connectPool();
     const line = JSON.stringify(msg) + '\n';
-    if (poolReady && pool && !pool.destroyed) pool.write(line);
-    else pending.push(line);
+    if (poolReady && pool && !pool.destroyed && pool.writable) {
+      try {
+        pool.write(line);
+        return;
+      } catch (err) {
+        console.error(`[${tag}/pool] write failed: ${err.message}`);
+        poolReady = false;
+        try { pool.destroy(); } catch (_) {}
+      }
+    }
+
+    // Only queue requests while establishing a fresh upstream session.
+    // Never silently replay a submit after a disconnect: its outcome may be
+    // unknown and replaying it can create duplicate/invalid submissions.
+    if (msg.method === 'submit') {
+      safeSendToClient({ id: msg.id, error: { message: 'Upstream pool disconnected; share was not replayed' } });
+      return;
+    }
+    if (pending.length >= MAX_PENDING) {
+      safeSendToClient({ id: msg.id, error: { message: 'Upstream connection queue is full' } });
+      return;
+    }
+    pending.push(line);
+    if (!pool || pool.destroyed) connectPool();
   }
 
   function safeSendToClient(obj) {
@@ -83,18 +106,31 @@ function createSession(tag, sendToClient, target = {}) {
   }
 
   function connectPool() {
+    if (pool && !pool.destroyed) return;
+    poolReady = false;
+    poolFailureNotified = false;
     // Capture this socket so async 'close'/'error' on a stale socket (from
     // a set_target-driven reconnect) doesn't tear down the new pool.
     const myPool = new net.Socket();
     myPool.setKeepAlive(true, 15000);
     pool = myPool;
+    minerId = null;
     poolBuffer = '';
     myPool.connect(currentPort, currentHost, () => {
       if (pool !== myPool) return;
       console.log(`[${tag}/pool] connected ${currentHost}:${currentPort}`);
       poolReady = true;
-      for (const line of pending) myPool.write(line);
+      const queued = pending;
       pending = [];
+      for (const line of queued) {
+        if (pool !== myPool || myPool.destroyed) break;
+        try { myPool.write(line); }
+        catch (err) {
+          console.error(`[${tag}/pool] queued write failed: ${err.message}`);
+          try { myPool.destroy(); } catch (_) {}
+          break;
+        }
+      }
     });
 
     myPool.on('data', (data) => {
@@ -106,7 +142,7 @@ function createSession(tag, sendToClient, target = {}) {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          if (msg.result && msg.result.id) minerId = msg.result.id;
+          if (msg.result && msg.result.id != null) minerId = msg.result.id;
           const job = (msg.result && msg.result.job) || (msg.method === 'job' && msg.params);
           if (job && job.target) {
             const diff = targetToDiff(job.target);
@@ -123,14 +159,25 @@ function createSession(tag, sendToClient, target = {}) {
       if (pool !== myPool) return;
       console.error(`[${tag}/pool] error: ${err.message}`);
       poolReady = false;
-      safeSendToClient({ error: 'Pool connection error: ' + err.message });
+      if (!poolFailureNotified) {
+        poolFailureNotified = true;
+        safeSendToClient({ error: 'Pool connection error: ' + err.message });
+      }
+      // 'close' performs the definitive reference cleanup.
+      try { myPool.destroy(); } catch (_) {}
     });
 
-    myPool.on('close', () => {
+    myPool.on('close', (hadError) => {
       if (pool !== myPool) return;
-      console.log(`[${tag}/pool] disconnected`);
+      console.log(`[${tag}/pool] disconnected${hadError ? ' (socket error)' : ''}`);
       poolReady = false;
-      safeSendToClient({ error: 'Pool disconnected' });
+      pool = null;
+      poolBuffer = '';
+      // Drop queued work from the dead Stratum session. A new login is
+      // required to obtain a fresh miner id and valid job.
+      pending = [];
+      if (!poolFailureNotified) safeSendToClient({ error: 'Pool disconnected' });
+      poolFailureNotified = false;
     });
   }
 
@@ -153,6 +200,11 @@ function createSession(tag, sendToClient, target = {}) {
         const newPort   = p.port   ? Number(p.port) : currentPort;
         const newWallet = p.wallet ? String(p.wallet) : walletOverride;
         const newWorker = (typeof p.worker === 'string') ? p.worker : workerOverride;
+        if (!newHost || newHost.length > 253 || /[\s/<>]/.test(newHost) ||
+            !Number.isInteger(newPort) || newPort < 1 || newPort > 65535) {
+          safeSendToClient({ id: msg.id, error: { message: 'Invalid pool host or port' } });
+          return;
+        }
         const changed   = newHost !== currentHost || newPort !== currentPort;
         currentHost = newHost;
         currentPort = newPort;
@@ -196,7 +248,8 @@ function createSession(tag, sendToClient, target = {}) {
 
   function onClientClose() {
     console.log(`[${tag}] client disconnected`);
-    if (pool) pool.destroy();
+    pending = [];
+    disconnectPool();
   }
 
   return {

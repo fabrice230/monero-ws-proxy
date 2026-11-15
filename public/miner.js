@@ -19,6 +19,8 @@ const state = {
   shareEtaTotal: 0,        // SNAPSHOT of diff/hashrate at anchor time — stable for the duration of one share search
   datasetBuilt: false,     // light mode: true on first 'mode'; full: set by dataset_progress
   hashrateMax: 0,          // session-max for the htop-style hashrate bar
+  nextSubmitId: 2,
+  pendingSubmits: new Map(),
 };
 
 const params = new URLSearchParams(location.search);
@@ -194,8 +196,9 @@ function log(msg) {
 
 function scheduleReconnect(reason) {
   if (!state.mining || state.reconnectTimer) return;
-  if (state.worker) state.worker.postMessage({ type: 'stop' });
-  log(`${reason}; reconnecting in 5s...`);
+  // A transport reconnect must not stop RandomX. The old pool job may
+  // remain useful until the new login supplies a replacement job.
+  log(`${reason}; reconnecting in 5s (miner continues until a new job)...`);
   state.reconnectTimer = setTimeout(() => {
     state.reconnectTimer = null;
     connectWS();
@@ -237,9 +240,12 @@ function connectWS() {
     const msg = JSON.parse(e.data);
 
     if (msg.error) {
-      if (msg.id === 2) {
+      const submitKey = msg.id == null ? null : String(msg.id);
+      if (submitKey !== null && state.pendingSubmits.has(submitKey)) {
+        const share = state.pendingSubmits.get(submitKey);
+        state.pendingSubmits.delete(submitKey);
         state.rejected++;
-        log('Share rejected: ' + (typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)));
+        log(`Share rejected for job ${share.job_id}: ` + (typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)));
         updateUI();
         return;
       }
@@ -270,23 +276,30 @@ function connectWS() {
 
     // Share response. Login responses can also contain status OK, so only
     // count submit responses as shares.
-    if (msg.id === 2 && msg.result && msg.result.status === 'OK') {
-      state.accepted++;
-      log('Share accepted! Total: ' + state.accepted);
-      // Share-ETA bar resets only here (and on Start). Snapshot the eta with
-      // the now-stable hashrate so the bar fills smoothly toward the next
-      // share without jittering.
-      state.shareEtaStart = performance.now();
-      state.shareEtaTotal = state.hashrate > 0 && state.currentJobDiff > 0
-        ? state.currentJobDiff / state.hashrate
-        : 0;
+    const submitKey = msg.id == null ? null : String(msg.id);
+    if (submitKey !== null && state.pendingSubmits.has(submitKey) && msg.result) {
+      const share = state.pendingSubmits.get(submitKey);
+      state.pendingSubmits.delete(submitKey);
+      if (msg.result.status === 'OK') {
+        state.accepted++;
+        log(`Share accepted for job ${share.job_id}! Total: ${state.accepted}`);
+        // Reset the estimate only after a confirmed accepted share.
+        state.shareEtaStart = performance.now();
+        state.shareEtaTotal = state.hashrate > 0 && state.currentJobDiff > 0
+          ? state.currentJobDiff / state.hashrate
+          : 0;
+      } else {
+        state.rejected++;
+        log(`Share rejected for job ${share.job_id}: unexpected pool response ${JSON.stringify(msg.result)}`);
+      }
       updateUI();
     }
   };
 
-  state.ws.onclose = () => {
+  state.ws.onclose = (event) => {
+    state.pendingSubmits.clear();
     state.status = 'disconnected';
-    log('Disconnected from proxy');
+    log(`Disconnected from proxy (code ${event.code || 'unknown'}${event.reason ? `, reason: ${event.reason}` : ''})`);
     updateUI();
     scheduleReconnect('Disconnected');
   };
@@ -555,15 +568,19 @@ function initWorker() {
           break;
         }
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-          state.ws.send(JSON.stringify({
-            method: 'submit',
-            params: {
-              job_id: msg.job_id,
-              nonce: msg.nonce,
-              result: msg.result,
-            },
-            id: 2,
-          }));
+          const submitId = state.nextSubmitId++;
+          state.pendingSubmits.set(String(submitId), { job_id: msg.job_id, nonce: msg.nonce });
+          try {
+            state.ws.send(JSON.stringify({
+              method: 'submit',
+              params: { job_id: msg.job_id, nonce: msg.nonce, result: msg.result },
+              id: submitId,
+            }));
+            log(`Share submitted to pool (request ${submitId})`);
+          } catch (err) {
+            state.pendingSubmits.delete(String(submitId));
+            log(`Share submission failed: ${err.message || err}`);
+          }
         } else {
           log('Share not submitted: pool connection is not open');
         }
@@ -675,6 +692,7 @@ function toggle() {
     state.shareEtaTotal = 0;
     state.datasetBuilt = false;
     state.lastJob = null;
+    state.pendingSubmits.clear();
     // Reset the dataset bar to its idle "not started" look.
     $('datasetBar').textContent = renderBar(0);
     $('datasetBarMeta').textContent = 'not started';

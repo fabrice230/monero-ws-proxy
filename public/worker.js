@@ -455,6 +455,9 @@ async function init(options = {}) {
 }
 
 function hexToBytes(hex) {
+  if (typeof hex !== 'string' || hex.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(hex)) {
+    throw new Error('Invalid hexadecimal input');
+  }
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
@@ -480,6 +483,9 @@ function writeU64Le(value) {
 
 function parsePoolTarget(targetHex) {
   const raw = hexToBytes(targetHex);
+  if (![4, 8, 32].includes(raw.length)) {
+    throw new Error(`Unsupported pool target length: ${raw.length} bytes`);
+  }
   let target64 = 0n;
 
   if (raw.length === 4) {
@@ -493,13 +499,14 @@ function parsePoolTarget(targetHex) {
     target64 = readLe(raw, 24, 8);
   }
 
+  if (target64 === 0n) throw new Error('Pool supplied a zero/invalid target');
   return writeU64Le(target64);
 }
 
 function hashMeetsTarget(hashPtr, targetBytes) {
   const hashHi = readLe(Module.HEAPU8, hashPtr + 24, 8);
   const target = readLe(targetBytes, 0, 8);
-  return hashHi < target;
+  return hashHi <= target;
 }
 
 function targetToDiff(targetBytes) {
@@ -865,6 +872,14 @@ self.onmessage = function(e) {
       break;
     case 'job': (async () => {
       const generation = ++jobGeneration;
+      if (typeof msg.blob !== 'string' || msg.blob.length < 86 || msg.blob.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(msg.blob)) {
+        throw new Error('Pool job has an invalid blob');
+      }
+      if (typeof msg.seed_hash !== 'string' || !/^[0-9a-f]{64}$/i.test(msg.seed_hash)) {
+        throw new Error('Pool job has an invalid RandomX seed_hash');
+      }
+      if (typeof msg.target !== 'string') throw new Error('Pool job is missing target');
+      parsePoolTarget(msg.target); // fail early instead of silently mining against target zero
       if (initPromise) await initPromise;
       if (generation !== jobGeneration) return;
       if (!await ensureCache(msg.seed_hash)) return;

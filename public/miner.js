@@ -10,8 +10,6 @@ const state = {
   workerReady: false,
   pendingConnect: false,
   reconnectTimer: null,
-  reconnectAttempt: 0,     // backoff : 1 s, 2 s, 4 s ... 30 s max, remis à 0 après un login réussi
-  lastMsgAt: 0,            // dernier message reçu du proxy (watchdog)
   currentJobId: null,
   currentJobSeq: 0,
   currentJobDiff: 0,
@@ -24,13 +22,6 @@ const state = {
 };
 
 const params = new URLSearchParams(location.search);
-
-// Mobile : mémoire limitée (iOS tue l'onglet très vite). On plafonne les
-// threads et on interdit le mode Full (~2,5 Go).
-const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
-  (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
-const MAX_THREADS = isMobile ? 2 : 32;
-
 // No SharedArrayBuffer (the page is not crossOriginIsolated, or ?sab=0 forces
 // it for A/B): no pthreads, so mining runs as N single-thread workers on the
 // randomx_st build (NoSabPool below), each in JIT'd light mode with its own
@@ -39,11 +30,9 @@ const noSab = params.get('sab') === '0' || window.crossOriginIsolated !== true;
 // ?fb_full=K (0..2, no SAB only): K of those workers become full-dataset
 // replicas (a private ~2.3 GB dataset each), built cooperatively by all workers
 // (fb_full.js); a worker that can't allocate one stays in light mode.
-const fbFull = (noSab && !isMobile) ? Math.max(0, Math.min(2, Math.floor(Number(params.get('fb_full')) || 0))) : 0;
-// Safe browser default: use light mode. Opt into full mode with ?full=1
-// (jamais sur mobile). `let` : repli automatique en Light si le mode Full
-// provoque des erreurs répétées (voir recoverWorker).
-let fullMemory = !isMobile && !noSab && params.get('full') === '1' && params.get('light') !== '1';
+const fbFull = noSab ? Math.max(0, Math.min(2, Math.floor(Number(params.get('fb_full')) || 0))) : 0;
+// Safe browser default: use light mode. Opt into full mode with ?full=1.
+const fullMemory = !noSab && params.get('full') === '1' && params.get('light') !== '1';
 // JIT defaults: on for all engines. The threaded-interpreter + V2-minimal
 // (split_inner_dispatch) path landed in worker.js makes the JIT a clear win
 // everywhere — Safari 560 H/s, Chrome 530 H/s, Firefox 550+ at 32T on M4
@@ -60,26 +49,16 @@ if (params.get('jit') === '0' || params.get('nojit') === '1') {
 const enableJit = jitDecision;
 const profileCore = params.get('profile') === '1';
 const requestedThreads = Number(params.get('threads'));
-// Mode Full : par défaut autant de threads que de cœurs (4 max), pas 32.
-const defaultThreads = fullMemory
-  ? Math.max(1, Math.min(navigator.hardwareConcurrency || 2, 4))
-  : 1;
-let datasetThreads = Math.max(1, Math.min(MAX_THREADS, requestedThreads || defaultThreads));
+const defaultThreads = fullMemory ? 32 : 1;
+let datasetThreads = Math.max(1, Math.min(32, requestedThreads || defaultThreads));
 // Dataset init thread count is decoupled from mining threads. The em-pthread
 // pool is 32 (build.sh:PTHREAD_POOL_SIZE), per-item init is independent
 // compute on a read-mostly cache, so oversubscription on hardware threads
 // is safe and helps wall-clock when hardwareConcurrency<32. Users at
 // ?threads=1 used to wait ~150s for init on M4 Mini; now ~26s. Override
 // for benchmarking with ?init_threads=N.
-let datasetInitThreads = Math.max(1, Math.min(MAX_THREADS,
-  Number(params.get('init_threads')) || MAX_THREADS));
-
-// ───── Paramètres de robustesse ──────────────────────────────────────
-const RECONNECT_BASE_MS   = 1000;    // 1re tentative après 1 s
-const RECONNECT_MAX_MS    = 30000;   // jamais plus de 30 s entre deux tentatives
-const WS_SILENCE_MS       = 120000;  // aucun message du proxy pendant 2 min → on reconnecte
-const WORKER_MAX_FAILURES = 4;       // au-delà : arrêt propre
-const LOG_MAX_LINES       = 150;     // taille max du journal
+let datasetInitThreads = Math.max(1, Math.min(32,
+  Number(params.get('init_threads')) || 32));
 
 const $ = (id) => document.getElementById(id);
 
@@ -203,7 +182,6 @@ function tickBars() {
 
 function log(msg) {
   const el = $('log');
-  if (!el) return;
   // Only auto-scroll to the bottom if the user is already there (within a few
   // px of slop for sub-pixel rounding). If they've scrolled up to read older
   // entries, leave their position alone.
@@ -211,64 +189,18 @@ function log(msg) {
   const line = document.createElement('div');
   line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
   el.appendChild(line);
-  // Limite la taille du journal (le nœud 0 est la bannière, on le garde).
-  while (el.childNodes.length > LOG_MAX_LINES) el.removeChild(el.childNodes[1]);
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
 
-// ───── Écran allumé (évite la mise en veille pendant le minage) ──────
-let wakeLock = null;
-async function acquireWakeLock() {
-  try {
-    if ('wakeLock' in navigator && !wakeLock) {
-      wakeLock = await navigator.wakeLock.request('screen');
-      wakeLock.addEventListener('release', () => { wakeLock = null; });
-    }
-  } catch (_) { wakeLock = null; }
-}
-function releaseWakeLock() {
-  try { if (wakeLock) wakeLock.release(); } catch (_) {}
-  wakeLock = null;
-}
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && state.mining) acquireWakeLock();
-});
-
-// ───── Reconnexion avec backoff ──────────────────────────────────────
 function scheduleReconnect(reason) {
   if (!state.mining || state.reconnectTimer) return;
   if (state.worker) state.worker.postMessage({ type: 'stop' });
-  const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * Math.pow(2, state.reconnectAttempt));
-  state.reconnectAttempt++;
-  log(`${reason}; reconnecting in ${Math.round(delay / 1000)}s...`);
+  log(`${reason}; reconnecting in 5s...`);
   state.reconnectTimer = setTimeout(() => {
     state.reconnectTimer = null;
     connectWS();
-  }, delay);
+  }, 5000);
 }
-
-// Retour du réseau : on reconnecte tout de suite sans attendre le backoff.
-window.addEventListener('online', () => {
-  if (!state.mining) return;
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) return;
-  log('Network back online; reconnecting now');
-  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
-  state.reconnectAttempt = 0;
-  connectWS();
-});
-
-// Watchdog : si le proxy ne dit plus rien (le pool envoie un job toutes les
-// ~30 s), la connexion est considérée comme morte.
-setInterval(() => {
-  if (!state.mining || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
-  if (performance.now() - state.lastMsgAt > WS_SILENCE_MS) {
-    log('No data from proxy for 2 min; connection considered dead');
-    const dead = state.ws;
-    state.ws = null;
-    try { dead.close(); } catch (_) {}
-    scheduleReconnect('Proxy silent');
-  }
-}, 10000);
 
 function connectWS() {
   if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
@@ -277,20 +209,9 @@ function connectWS() {
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   state.nicehash = false;
-  let ws;
-  try {
-    ws = new WebSocket(`${proto}//${location.host}`);
-  } catch (e) {
-    log('WebSocket creation failed: ' + (e && e.message));
-    scheduleReconnect('WebSocket creation failed');
-    return;
-  }
-  state.ws = ws;
-  state.lastMsgAt = performance.now();
+  state.ws = new WebSocket(`${proto}//${location.host}`);
 
-  ws.onopen = () => {
-    if (state.ws !== ws) return;
-    state.lastMsgAt = performance.now();
+  state.ws.onopen = () => {
     state.status = 'connected to proxy';
     log('Connected to proxy');
     updateUI();
@@ -298,32 +219,22 @@ function connectWS() {
     // Tell the proxy which pool + wallet this session wants BEFORE login,
     // so it can reconnect upstream if the user customised them.
     const target = readConnectionInputs();
-    ws.send(JSON.stringify({
+    state.ws.send(JSON.stringify({
       method: 'set_target',
       params: target,
       id: 0,
     }));
     log(`Pool target → ${target.host}:${target.port}, wallet ${(target.wallet || '').slice(0, 12)}…`);
 
-    ws.send(JSON.stringify({
+    state.ws.send(JSON.stringify({
       method: 'login',
       params: {},
       id: 1,
     }));
   };
 
-  ws.onmessage = (e) => {
-    // Ignore les messages d'un ancien socket (reconnexion en cours).
-    if (state.ws !== ws) return;
-    state.lastMsgAt = performance.now();
-
-    let msg;
-    try {
-      msg = JSON.parse(e.data);
-    } catch (_) {
-      log('Bad message from proxy (ignored)');
-      return;
-    }
+  state.ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
 
     if (msg.error) {
       if (msg.id === 2) {
@@ -337,8 +248,8 @@ function connectWS() {
       log('Error: ' + errorText);
       state.status = 'error';
       updateUI();
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.close();
       }
       scheduleReconnect('Pool connection error');
       return;
@@ -347,7 +258,6 @@ function connectWS() {
     // Login response with first job
     if (msg.result && msg.result.job) {
       state.nicehash = Array.isArray(msg.result.extensions) && msg.result.extensions.includes('nicehash');
-      state.reconnectAttempt = 0;   // connexion réussie : le backoff repart de 1 s
       log('Logged in, received first job');
       handleJob(msg.result.job);
     }
@@ -362,7 +272,6 @@ function connectWS() {
     // count submit responses as shares.
     if (msg.id === 2 && msg.result && msg.result.status === 'OK') {
       state.accepted++;
-      workerFailures = 0;           // le minage fonctionne : on oublie les anciennes erreurs
       log('Share accepted! Total: ' + state.accepted);
       // Share-ETA bar resets only here (and on Start). Snapshot the eta with
       // the now-stable hashrate so the bar fills smoothly toward the next
@@ -375,16 +284,14 @@ function connectWS() {
     }
   };
 
-  ws.onclose = (e) => {
-    if (state.ws !== ws) return;
+  state.ws.onclose = () => {
     state.status = 'disconnected';
-    log(`Disconnected from proxy${e && e.code ? ` (code ${e.code})` : ''}`);
+    log('Disconnected from proxy');
     updateUI();
     scheduleReconnect('Disconnected');
   };
 
-  ws.onerror = () => {
-    if (state.ws !== ws) return;
+  state.ws.onerror = (e) => {
     log('WebSocket error');
   };
 }
@@ -414,43 +321,6 @@ function handleJob(job) {
     job_seq: state.currentJobSeq,
     nicehash: job.nicehash,
   });
-}
-
-// ───── Récupération automatique du worker ────────────────────────────
-// En cas d'erreur du worker (mémoire, crash WASM...), on le recrée au lieu
-// de laisser la page figée. Dès la 2e erreur en mode Full, repli en Light.
-// Après WORKER_MAX_FAILURES échecs sans share accepté, arrêt propre.
-let workerFailures = 0;
-let recoverTimer = null;
-
-function recoverWorker(reason) {
-  if (!state.mining || recoverTimer) return;
-  workerFailures++;
-  if (workerFailures > WORKER_MAX_FAILURES) {
-    log(`Too many worker failures (${reason}); stopping. Reload the page to retry.`);
-    toggle();
-    state.status = 'stopped (worker errors)';
-    updateUI();
-    return;
-  }
-  if (fullMemory && workerFailures >= 2) {
-    fullMemory = false;
-    log('Full mode keeps failing: falling back to light mode');
-  }
-  log(`Recovering worker (${reason}), attempt ${workerFailures}/${WORKER_MAX_FAILURES}...`);
-  if (state.worker) {
-    try { state.worker.terminate(); } catch (_) {}
-  }
-  state.worker = null;
-  state.workerReady = false;
-  state.hashrate = 0;
-  state.datasetBuilt = false;
-  state.status = 'restarting worker…';
-  updateUI();
-  recoverTimer = setTimeout(() => {
-    recoverTimer = null;
-    if (state.mining) initWorker();
-  }, 3000);
 }
 
 // Worker-shaped facade over N single-thread randomx_st workers (no SAB). It
@@ -590,18 +460,8 @@ function initWorker() {
   }
 
   const vTag = (window.MINER_BUILD || 'dev').replace(/[^a-zA-Z0-9-]/g, '');
-  try {
-    state.worker = noSab ? new NoSabPool(datasetThreads, vTag, fbFull) : new Worker(`worker.js?v=${vTag}`);
-  } catch (e) {
-    state.worker = null;
-    log('Worker creation failed: ' + (e && e.message));
-    recoverWorker('worker creation failed');
-    return;
-  }
+  state.worker = noSab ? new NoSabPool(datasetThreads, vTag, fbFull) : new Worker(`worker.js?v=${vTag}`);
   log(`build=${window.MINER_BUILD || '?'} (cside-jit split)`);
-  if (isMobile) {
-    log(`Mobile détecté : max ${MAX_THREADS} threads, mode Full désactivé`);
-  }
   if (noSab) {
     log(`No SharedArrayBuffer${params.get('sab') === '0' ? ' (forced by ?sab=0)' : ''}: ` +
         `${datasetThreads} single-thread light-mode workers (randomx_st, ~300 MB each)`);
@@ -620,26 +480,20 @@ function initWorker() {
   if (window.__coiLog) log(window.__coiLog);
   log(`navigator.hardwareConcurrency=${navigator.hardwareConcurrency || 'unknown'}, mining threads=${datasetThreads}, init threads=${datasetInitThreads}`);
 
-  const thisWorker = state.worker;
-
   state.worker.onerror = (e) => {
-    if (state.worker !== thisWorker) return;
-    const where = e.filename ? ` (${e.filename}:${e.lineno || 0})` : '';
-    log(`Worker error: ${e.message || 'unknown error'}${where}`);
+    const location = e.filename ? ` (${e.filename}:${e.lineno || 0})` : '';
+    log(`Worker error: ${e.message || 'unknown error'}${location}`);
     state.status = 'worker error';
     updateUI();
-    recoverWorker('worker error');
   };
 
   state.worker.onmessageerror = () => {
-    if (state.worker !== thisWorker) return;
     log('Worker message error');
     state.status = 'worker error';
     updateUI();
   };
 
   state.worker.onmessage = (e) => {
-    if (state.worker !== thisWorker) return;
     const msg = e.data;
     switch (msg.type) {
       case 'ready':
@@ -774,7 +628,6 @@ function initWorker() {
         log('Error: ' + msg.message);
         state.status = 'error';
         updateUI();
-        recoverWorker('worker reported an error');
         break;
     }
   };
@@ -794,11 +647,11 @@ function initWorker() {
 }
 
 // Reads the threads input (the only source of truth the user can edit) and
-// returns a clamped 1-MAX_THREADS integer.
+// returns a clamped 1-32 integer.
 function readDesiredThreads() {
   const inputEl = $('rebuildThreads');
   if (!inputEl) return datasetThreads;
-  return Math.max(1, Math.min(MAX_THREADS, Math.floor(Number(inputEl.value) || 1)));
+  return Math.max(1, Math.min(32, Math.floor(Number(inputEl.value) || 1)));
 }
 
 function toggle() {
@@ -816,8 +669,6 @@ function toggle() {
     state.shareEtaTotal = 0;
     state.datasetBuilt = false;
     state.lastJob = null;
-    state.reconnectAttempt = 0;
-    workerFailures = 0;
     $('datasetBar').textContent = renderBar(0);
     $('datasetBarMeta').textContent = 'not started';
     state.mode = 'standby';
@@ -827,12 +678,7 @@ function toggle() {
       clearTimeout(state.reconnectTimer);
       state.reconnectTimer = null;
     }
-    if (recoverTimer) {
-      clearTimeout(recoverTimer);
-      recoverTimer = null;
-    }
     state.ws = null;
-    releaseWakeLock();
     log('Mining stopped');
   } else {
     const desired = readDesiredThreads();
@@ -851,9 +697,6 @@ function toggle() {
     state.shareEtaTotal = 0;
     state.hashrateMax = 0;
     state.datasetBuilt = false;
-    state.reconnectAttempt = 0;
-    workerFailures = 0;
-    acquireWakeLock();
     log(`Starting miner${enableJit ? '' : ' without JIT'} in ${fullMemory ? `full mode (${datasetThreads} threads)` : 'light mode'}${profileCore ? ' with core profile' : ''}...`);
     initWorker();
   }
@@ -861,7 +704,7 @@ function toggle() {
 }
 
 function hardRebuild(newThreads) {
-  const clamped = Math.max(1, Math.min(MAX_THREADS, Math.floor(Number(newThreads) || 1)));
+  const clamped = Math.max(1, Math.min(32, Math.floor(Number(newThreads) || 1)));
   datasetThreads = clamped;
 
   if (state.worker) {
@@ -899,9 +742,6 @@ $('toggle').addEventListener('click', toggle);
 
 const threadsInput = $('rebuildThreads');
 const miniThreadsInput = $('miniThreads');
-// Le plafond de threads s'applique aussi aux champs de saisie.
-if (threadsInput) threadsInput.max = String(MAX_THREADS);
-if (miniThreadsInput) miniThreadsInput.max = String(MAX_THREADS);
 if (threadsInput) {
   threadsInput.value = String(datasetThreads);
   $('rebuildBtn').addEventListener('click', () => {
@@ -923,9 +763,6 @@ if (miniThreadsInput) {
     hardRebuild(miniThreadsInput.value);
   });
 }
-
-// Rafraîchit la barre « Next share ETA » et le mini-affichage.
-setInterval(tickBars, 500);
 
 // ───── Connection settings (wallet + pool host:port + presets) ────────
 
@@ -1007,27 +844,18 @@ if (workerInput) {
   });
 }
 
-function applyPreset(key) {
-  const preset = POOL_PRESETS[key];
-  if (preset && poolHostInput && poolPortInput) {
-    poolHostInput.value = preset.host;
-    poolPortInput.value = preset.port;
-    try {
-      localStorage.setItem(LS_POOL_HOST, preset.host);
-      localStorage.setItem(LS_POOL_PORT, preset.port);
-    } catch (_) {}
-    log(`Applied preset: ${key} (${preset.host}:${preset.port})`);
-  }
-}
-
 document.querySelectorAll('[data-preset]').forEach((btn) => {
-  btn.addEventListener('click', () => applyPreset(btn.getAttribute('data-preset')));
-});
-
-// index.html n'a pas d'attribut data-preset : on lie aussi les boutons par id.
-[['presetSupportxmr', 'supportxmr'], ['presetMoneroocean', 'moneroocean']].forEach(([id, key]) => {
-  const btn = $(id);
-  if (btn && !btn.hasAttribute('data-preset')) {
-    btn.addEventListener('click', () => applyPreset(key));
-  }
+  btn.addEventListener('click', () => {
+    const key = btn.getAttribute('data-preset');
+    const preset = POOL_PRESETS[key];
+    if (preset && poolHostInput && poolPortInput) {
+      poolHostInput.value = preset.host;
+      poolPortInput.value = preset.port;
+      try {
+        localStorage.setItem(LS_POOL_HOST, preset.host);
+        localStorage.setItem(LS_POOL_PORT, preset.port);
+      } catch (_) {}
+      log(`Applied preset: ${key} (${preset.host}:${preset.port})`);
+    }
+  });
 });

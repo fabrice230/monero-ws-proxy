@@ -635,9 +635,6 @@ function initWorker() {
   const jitExperiment = params.get('jit_exp') || '';
   if (jitExperiment) {
     const tokens = jitExperiment.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-    // 'reuse' / 'reuse2' are the only modes that produce wrong hashes; the
-    // rest (threaded / regs_mem / inline_fprc / no_*) are all correctness-
-    // preserving and just toggle codegen.
     const wrongHash = tokens.includes('reuse') || tokens.includes('reuse2');
     if (wrongHash) {
       log(`JIT experiment mode active: ${jitExperiment} (hashes will be WRONG; use only for timing analysis)`);
@@ -645,7 +642,6 @@ function initWorker() {
       log(`JIT experiment mode active: ${jitExperiment} (hashes are correct)`);
     }
   }
-  // ?jit_profile=auto|arm|x86: threaded-module generator profile (worker.js).
   const jitProfile = params.get('jit_profile') || 'auto';
   state.worker.postMessage({ type: 'init', enableJit, fullMemory, datasetThreads, datasetInitThreads, profileCore, jitExperiment, jitProfile });
 }
@@ -659,8 +655,6 @@ function readDesiredThreads() {
 }
 
 function toggle() {
-  // One-shot: kill the attention pulse the moment the user engages either
-  // Start button (or hits Stop later — both call this).
   $('toggle').classList.remove('pulse');
   if ($('miniToggle')) $('miniToggle').classList.remove('pulse');
   if (state.mining) {
@@ -675,7 +669,6 @@ function toggle() {
     state.shareEtaTotal = 0;
     state.datasetBuilt = false;
     state.lastJob = null;
-    // Reset the dataset bar to its idle "not started" look.
     $('datasetBar').textContent = renderBar(0);
     $('datasetBarMeta').textContent = 'not started';
     state.mode = 'standby';
@@ -688,11 +681,6 @@ function toggle() {
     state.ws = null;
     log('Mining stopped');
   } else {
-    // Sync datasetThreads from the input so the very first Start picks up
-    // any value the user set before clicking. If a (paused) worker is sitting
-    // around from a previous run with a different thread count, terminate it
-    // so the new count actually takes effect — otherwise initWorker() would
-    // reuse the stale instance.
     const desired = readDesiredThreads();
     if (desired !== datasetThreads) {
       datasetThreads = desired;
@@ -715,18 +703,10 @@ function toggle() {
   updateUI();
 }
 
-// Hard rebuild: terminate the worker entirely and respawn with the requested
-// thread count. This avoids destroy_mining_context (Emscripten pthread join
-// corrupts wasm memory). The new worker re-runs init from scratch; on 'ready'
-// state.lastJob is replayed so it rebuilds the dataset and resumes hashing.
 function hardRebuild(newThreads) {
   const clamped = Math.max(1, Math.min(32, Math.floor(Number(newThreads) || 1)));
   datasetThreads = clamped;
 
-  // A "hard rebuild" always means a fresh wasm instance. Terminate the
-  // existing worker unconditionally — otherwise the Stop→change-threads
-  // →Hard-rebuild path would silently reuse the paused worker (which still
-  // holds the old datasetThreads baked into its mineCtx).
   if (state.worker) {
     try { state.worker.terminate(); } catch (_) {}
     state.worker = null;
@@ -751,13 +731,10 @@ function hardRebuild(newThreads) {
   state.shareEtaStart = 0;
   state.shareEtaTotal = 0;
   state.datasetBuilt = false;
-  // Reset the dataset bar so the rebuild is visible immediately.
   $('datasetBarRow').hidden = false;
   $('datasetBar').textContent = renderBar(0);
   $('datasetBarMeta').textContent = 'starting…';
   updateUI();
-  // Worker already terminated above; initWorker() spawns a fresh one and the
-  // 'ready' handler replays state.lastJob.
   initWorker();
 }
 
@@ -773,7 +750,6 @@ if (threadsInput) {
 }
 if (miniThreadsInput) {
   miniThreadsInput.value = String(datasetThreads);
-  // Two-way sync with the expanded input.
   miniThreadsInput.addEventListener('input', () => {
     if (threadsInput) threadsInput.value = miniThreadsInput.value;
   });
@@ -788,24 +764,18 @@ if (miniThreadsInput) {
   });
 }
 
-// ───── Connection settings (wallet + pool host:port + donate macro) ────────
+// ───── Connection settings (wallet + pool host:port + presets) ────────
 
 const LS_WALLET    = 'rxminer.wallet';
 const LS_POOL_HOST = 'rxminer.pool_host';
 const LS_POOL_PORT = 'rxminer.pool_port';
 const LS_WORKER    = 'rxminer.worker';
 
-// Pool presets the user can one-click into the host/port inputs. Plain TCP
-// only — the proxy doesn't wrap pool sockets in TLS, so TLS-only ports of
-// each pool are intentionally omitted.
 const POOL_PRESETS = {
   supportxmr:   { host: 'pool.supportxmr.com',     port: 3333  },
   moneroocean:  { host: 'gulf.moneroocean.stream', port: 10004 },
 };
 
-// Defaults injected by the proxy via window.MINER_DEFAULTS (rewritten from
-// config.js at serve time). Fall back to empty strings if not present so
-// the page still works when served outside the proxy.
 const MINER_DEFAULTS = (window.MINER_DEFAULTS && typeof window.MINER_DEFAULTS === 'object')
   ? window.MINER_DEFAULTS
   : { wallet: '', poolHost: '', poolPort: '' };
@@ -822,251 +792,70 @@ const poolHostInput = $('poolHostInput');
 const poolPortInput = $('poolPortInput');
 const workerInput   = $('workerInput');
 
-// Wallet truncation: store the full address in .dataset.full; only that is
-// authoritative. The visible input.value is the truncated `WWWWWWWW……WWWWWWWW`
-// form while blurred. On focus the field swaps back to full text so the user
-// can edit normally.
-function truncateAddr(addr) {
-  if (!addr || addr.length <= 20) return addr || '';
-  return addr.slice(0, 8) + '……' + addr.slice(-8);
-}
-function getFullWallet() {
-  if (!walletInput) return '';
-  return (walletInput.dataset.full || walletInput.value || '').trim();
-}
-function setFullWallet(full) {
-  if (!walletInput) return;
-  const v = (full || '').trim();
-  walletInput.dataset.full = v;
-  walletInput.value = (document.activeElement === walletInput) ? v : truncateAddr(v);
-}
-
-const initWallet = readStored(LS_WALLET, MINER_DEFAULTS.wallet);
-const initHost   = readStored(LS_POOL_HOST, MINER_DEFAULTS.poolHost);
-const initPort   = readStored(LS_POOL_PORT, MINER_DEFAULTS.poolPort);
-const initWorkerName = readStored(LS_WORKER, '');
-if (walletInput)   setFullWallet(initWallet);
-if (poolHostInput) poolHostInput.value = initHost;
-if (poolPortInput) poolPortInput.value = initPort;
-if (workerInput)   workerInput.value   = initWorkerName;
-
-function persistConnection() {
-  try {
-    if (walletInput)   localStorage.setItem(LS_WALLET,    getFullWallet());
-    if (poolHostInput) localStorage.setItem(LS_POOL_HOST, poolHostInput.value.trim());
-    if (poolPortInput) localStorage.setItem(LS_POOL_PORT, poolPortInput.value.trim());
-    if (workerInput)   localStorage.setItem(LS_WORKER,    workerInput.value.trim());
-  } catch (_) {}
+function readConnectionInputs() {
+  const wallet = walletInput ? (walletInput.dataset.full || walletInput.value.trim()) : (MINER_DEFAULTS.wallet || '');
+  const host = poolHostInput ? (poolHostInput.value.trim() || MINER_DEFAULTS.poolHost) : (MINER_DEFAULTS.poolHost || '');
+  const port = poolPortInput ? (parseInt(poolPortInput.value, 10) || Number(MINER_DEFAULTS.poolPort) || 3333) : 3333;
+  const worker = workerInput ? workerInput.value.trim() : '';
+  return { wallet, host, port, worker };
 }
 
 if (walletInput) {
+  const savedWallet = readStored(LS_WALLET, MINER_DEFAULTS.wallet || '');
+  walletInput.value = savedWallet;
+  walletInput.dataset.full = savedWallet;
+
   walletInput.addEventListener('focus', () => {
-    walletInput.value = getFullWallet();
+    walletInput.value = walletInput.dataset.full || walletInput.value;
   });
-  walletInput.addEventListener('input', () => {
-    walletInput.dataset.full = walletInput.value.trim();
-  });
+
   walletInput.addEventListener('blur', () => {
-    walletInput.dataset.full = walletInput.value.trim();
-    walletInput.value = truncateAddr(walletInput.dataset.full);
-    persistConnection();
-  });
-}
-if (poolHostInput) poolHostInput.addEventListener('change', persistConnection);
-if (poolPortInput) poolPortInput.addEventListener('change', persistConnection);
-if (workerInput)   workerInput.addEventListener('change',   persistConnection);
-
-function readConnectionInputs() {
-  return {
-    wallet: getFullWallet() || MINER_DEFAULTS.wallet || '',
-    host:   (poolHostInput && poolHostInput.value.trim()) || MINER_DEFAULTS.poolHost || '',
-    port:   Number((poolPortInput && poolPortInput.value.trim()) || MINER_DEFAULTS.poolPort) || 0,
-    worker: (workerInput && workerInput.value.trim()) || '',
-  };
-}
-
-// Apply a pool preset (host + port only). Wallet and worker stay as the
-// user set them.
-function applyPreset(name) {
-  const p = POOL_PRESETS[name];
-  if (!p) return;
-  if (poolHostInput) poolHostInput.value = p.host;
-  if (poolPortInput) poolPortInput.value = String(p.port);
-  persistConnection();
-  log(`Preset → ${name} (${p.host}:${p.port})`);
-}
-const presetSupportxmrBtn  = $('presetSupportxmr');
-const presetMonerooceanBtn = $('presetMoneroocean');
-if (presetSupportxmrBtn)  presetSupportxmrBtn.addEventListener('click',  () => applyPreset('supportxmr'));
-if (presetMonerooceanBtn) presetMonerooceanBtn.addEventListener('click', () => applyPreset('moneroocean'));
-
-// Wallet-setup collapse — toggles worker/preset/pool rows. Initial state is
-// collapsed (those rows are advanced; most users just want wallet + Set).
-// Persisted to localStorage so the choice survives reload.
-const LS_SETUP_COLLAPSED = 'rxminer.setup_collapsed';
-const setupToggle   = $('setupToggle');
-const walletSection = $('walletSection');
-if (setupToggle && walletSection) {
-  let collapsed = readStored(LS_SETUP_COLLAPSED, '1') !== '0';
-  const apply = () => {
-    walletSection.classList.toggle('expanded', !collapsed);
-    setupToggle.textContent = collapsed ? '[+]' : '[-]';
-  };
-  apply();
-  setupToggle.addEventListener('click', () => {
-    collapsed = !collapsed;
-    apply();
-    try { localStorage.setItem(LS_SETUP_COLLAPSED, collapsed ? '1' : '0'); } catch (_) {}
-  });
-}
-
-
-const donateBtn = $('donateBtn');
-if (donateBtn) {
-  donateBtn.addEventListener('click', () => {
-    if (walletInput)   setFullWallet(MINER_DEFAULTS.wallet);
-    if (poolHostInput) poolHostInput.value = MINER_DEFAULTS.poolHost;
-    if (poolPortInput) poolPortInput.value = MINER_DEFAULTS.poolPort;
-    persistConnection();
-    log('Donation defaults loaded — Hard rebuild (or Stop/Start) to apply');
-  });
-}
-
-// "Set" button: commits the wallet + pool inputs to localStorage and opens
-// a throwaway WebSocket to the proxy, sends set_target + a probe login, and
-// reports back whether the pool accepted the address.
-const setAddressBtn = $('setAddressBtn');
-if (setAddressBtn) {
-  setAddressBtn.addEventListener('click', () => {
-    persistConnection();
-    const target = readConnectionInputs();
-    if (!target.wallet || !target.host || !target.port) {
-      log('Set: wallet, host, and port are all required');
-      return;
+    const full = walletInput.value.trim();
+    walletInput.dataset.full = full;
+    try { localStorage.setItem(LS_WALLET, full); } catch (_) {}
+    if (full.length > 16) {
+      walletInput.value = full.slice(0, 8) + '……' + full.slice(-8);
     }
-    log(`Testing handshake → ${target.host}:${target.port}, wallet ${target.wallet.slice(0, 12)}…`);
-    setAddressBtn.disabled = true;
-    setAddressBtn.textContent = 'Testing…';
+  });
 
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const probe = new WebSocket(`${proto}//${location.host}`);
-    let done = false;
-    const finish = (text) => {
-      if (done) return;
-      done = true;
-      log(text);
-      try { probe.close(); } catch (_) {}
-      setAddressBtn.disabled = false;
-      setAddressBtn.textContent = 'Set';
-    };
+  if (savedWallet.length > 16) {
+    walletInput.value = savedWallet.slice(0, 8) + '……' + savedWallet.slice(-8);
+  }
+}
 
-    probe.onopen = () => {
-      probe.send(JSON.stringify({ method: 'set_target', params: target, id: 0 }));
-      probe.send(JSON.stringify({ method: 'login',      params: {},     id: 99 }));
-    };
-    probe.onmessage = (e) => {
-      let msg;
-      try { msg = JSON.parse(e.data); } catch (_) { return; }
-      if (msg.error) {
-        const err = typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error);
-        finish(`Handshake FAILED: ${err}`);
-      } else if (msg.id === 99 && msg.result) {
-        finish(`Handshake OK — pool accepted login (job ${msg.result.job ? msg.result.job.job_id : '?'})`);
-      }
-    };
-    probe.onerror = () => finish('Handshake FAILED: WebSocket error');
-    setTimeout(() => finish('Handshake TIMEOUT (no pool response in 6 s)'), 6000);
+if (poolHostInput) {
+  poolHostInput.value = readStored(LS_POOL_HOST, MINER_DEFAULTS.poolHost || 'gulf.moneroocean.stream');
+  poolHostInput.addEventListener('input', () => {
+    try { localStorage.setItem(LS_POOL_HOST, poolHostInput.value.trim()); } catch (_) {}
   });
 }
 
-updateUI();
-tickBars();
-setInterval(tickBars, 1000);
+if (poolPortInput) {
+  poolPortInput.value = readStored(LS_POOL_PORT, String(MINER_DEFAULTS.poolPort || 10004));
+  poolPortInput.addEventListener('input', () => {
+    try { localStorage.setItem(LS_POOL_PORT, poolPortInput.value.trim()); } catch (_) {}
+  });
+}
 
-// ───── Lorem ipsum scrollable background ────────────────────────────────────
+if (workerInput) {
+  workerInput.value = readStored(LS_WORKER, '');
+  workerInput.addEventListener('input', () => {
+    try { localStorage.setItem(LS_WORKER, workerInput.value.trim()); } catch (_) {}
+  });
+}
 
-(function setupLorem() {
-  const bg = $('loremBg');
-  if (!bg) return;
-  const para = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.';
-  const headings = [
-    'de natura miner', 'wasm musings', 'on the dataset', 'thread harmony',
-    'cryptographic prose', 'hash incantations', 'p2pool ponderings', 'randomx reverie',
-  ];
-  const frag = document.createDocumentFragment();
-  for (let i = 0; i < 36; i++) {
-    if (i % 4 === 0) {
-      const h = document.createElement('h2');
-      h.textContent = headings[(i / 4) % headings.length];
-      frag.appendChild(h);
+document.querySelectorAll('[data-preset]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const key = btn.getAttribute('data-preset');
+    const preset = POOL_PRESETS[key];
+    if (preset && poolHostInput && poolPortInput) {
+      poolHostInput.value = preset.host;
+      poolPortInput.value = preset.port;
+      try {
+        localStorage.setItem(LS_POOL_HOST, preset.host);
+        localStorage.setItem(LS_POOL_PORT, preset.port);
+      } catch (_) {}
+      log(`Applied preset: ${key} (${preset.host}:${preset.port})`);
     }
-    const p = document.createElement('p');
-    p.textContent = para;
-    frag.appendChild(p);
-  }
-  bg.appendChild(frag);
-})();
-
-// ───── Floating widget: drag + collapse ─────────────────────────────────────
-
-(function setupWidget() {
-  const widget = $('widget');
-  const header = $('widgetHeader');
-  const toggle = $('widgetToggle');
-  if (!widget || !header || !toggle) return;
-
-  let dragOffset = null;
-
-  function beginDrag(clientX, clientY) {
-    const rect = widget.getBoundingClientRect();
-    dragOffset = { x: clientX - rect.left, y: clientY - rect.top };
-    // Switch from transform-centering to explicit left/top so we can move it.
-    widget.style.transform = 'none';
-    widget.style.left = rect.left + 'px';
-    widget.style.top = rect.top + 'px';
-    widget.classList.add('dragging');
-  }
-
-  function moveDrag(clientX, clientY) {
-    if (!dragOffset) return;
-    const w = widget.offsetWidth;
-    const h = widget.offsetHeight;
-    let nx = clientX - dragOffset.x;
-    let ny = clientY - dragOffset.y;
-    nx = Math.max(0, Math.min(window.innerWidth - w, nx));
-    ny = Math.max(0, Math.min(window.innerHeight - h, ny));
-    widget.style.left = nx + 'px';
-    widget.style.top = ny + 'px';
-  }
-
-  function endDrag() {
-    dragOffset = null;
-    widget.classList.remove('dragging');
-  }
-
-  header.addEventListener('mousedown', (e) => {
-    if (e.target === toggle || toggle.contains(e.target)) return;
-    e.preventDefault();
-    beginDrag(e.clientX, e.clientY);
   });
-  window.addEventListener('mousemove', (e) => moveDrag(e.clientX, e.clientY));
-  window.addEventListener('mouseup', endDrag);
-
-  // Touch support: same flow.
-  header.addEventListener('touchstart', (e) => {
-    if (e.target === toggle || toggle.contains(e.target)) return;
-    const t = e.touches[0];
-    beginDrag(t.clientX, t.clientY);
-  }, { passive: true });
-  window.addEventListener('touchmove', (e) => {
-    if (!dragOffset) return;
-    const t = e.touches[0];
-    moveDrag(t.clientX, t.clientY);
-  }, { passive: true });
-  window.addEventListener('touchend', endDrag);
-
-  toggle.addEventListener('click', () => {
-    widget.classList.toggle('collapsed');
-    toggle.textContent = widget.classList.contains('collapsed') ? '[+]' : '[-]';
-  });
-})();
+});

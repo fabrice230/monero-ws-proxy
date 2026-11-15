@@ -86,6 +86,8 @@ function createSession(tag, sendToClient, target = {}) {
     // Capture this socket so async 'close'/'error' on a stale socket (from
     // a set_target-driven reconnect) doesn't tear down the new pool.
     const myPool = new net.Socket();
+    // Désactive l'algorithme de Nagle : les submit partent immédiatement.
+    myPool.setNoDelay(true);
     myPool.setKeepAlive(true, 15000);
     pool = myPool;
     poolBuffer = '';
@@ -173,7 +175,9 @@ function createSession(tag, sendToClient, target = {}) {
         const baseLogin  = walletOverride || config.WALLET;
         const baseWorker = (workerOverride && workerOverride.trim()) || config.WORKER_NAME || 'x';
         const uniqueWorker = `${baseWorker}-${sessionUid}`;
-        msg.params.login = baseLogin;
+        // Difficulté fixe optionnelle (config.FIXED_DIFF) : suffixe "+diff"
+        // sur le wallet pour obtenir des shares plus fréquents.
+        msg.params.login = baseLogin + (config.FIXED_DIFF ? '+' + config.FIXED_DIFF : '');
         // supportxmr reads worker from `pass`; xmrig-style pools read `rigid`.
         // Sending both keeps both happy.
         msg.params.pass  = uniqueWorker;
@@ -270,8 +274,15 @@ const requestHandler = (req, res) => {
 };
 
 const server = http.createServer(requestHandler);
+// Keep-alive HTTP : évite les coupures de connexions inactives
+// (le proxy de Fly ferme les connexions silencieuses après ~60 s).
+server.keepAliveTimeout = 65000;
+server.headersTimeout   = 66000;
+server.on('connection', (s) => { s.setNoDelay(true); s.setKeepAlive(true, 15000); });
 
-const wss = new WebSocketServer({ server });
+// perMessageDeflate désactivé : les messages stratum sont minuscules,
+// la compression n'ajoute que de la latence.
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
 wss.on('connection', (ws, req) => {
   console.log('[ws] browser connected');
   const url = new URL(req.url, 'http://localhost');
@@ -281,7 +292,8 @@ wss.on('connection', (ws, req) => {
   if (routed && (!host || host.length > 253 || /[\s/<>]/.test(host) || !Number.isInteger(port) || port < 1 || port > 65535)) {
     ws.close(1008, 'Invalid pool target'); return;
   }
-  const session = createSession('ws', (text) => ws.send(text), routed ? { host, port } : {});
+  // Envoi immédiat, sans compression.
+  const session = createSession('ws', (text) => ws.send(text, { compress: false }), routed ? { host, port } : {});
   if (routed) session.setLoginPassthrough();
   ws.alive = true;
   ws.on('pong', () => { ws.alive = true; });
@@ -304,6 +316,8 @@ wss.on('close', () => clearInterval(wsHeartbeat));
 // Raw-TCP stratum front-door for xmrig and friends. They send their own
 // login fields, so we don't rewrite anything for these clients.
 const tcpServer = net.createServer((socket) => {
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 15000);
   console.log(`[tcp] stratum client ${socket.remoteAddress}:${socket.remotePort}`);
   const session = createSession('tcp', (text) => {
     if (!socket.destroyed) socket.write(text + '\n');

@@ -31,8 +31,8 @@ const noSab = params.get('sab') === '0' || window.crossOriginIsolated !== true;
 // replicas (a private ~2.3 GB dataset each), built cooperatively by all workers
 // (fb_full.js); a worker that can't allocate one stays in light mode.
 const fbFull = noSab ? Math.max(0, Math.min(2, Math.floor(Number(params.get('fb_full')) || 0))) : 0;
-// Full-memory mode is the default. Opt out with ?light=1 (or legacy ?full=0).
-const fullMemory = !noSab && params.get('light') !== '1' && params.get('full') !== '0';
+// Safe browser default: use light mode. Opt into full mode with ?full=1.
+const fullMemory = !noSab && params.get('full') === '1' && params.get('light') !== '1';
 // JIT defaults: on for all engines. The threaded-interpreter + V2-minimal
 // (split_inner_dispatch) path landed in worker.js makes the JIT a clear win
 // everywhere — Safari 560 H/s, Chrome 530 H/s, Firefox 550+ at 32T on M4
@@ -49,7 +49,7 @@ if (params.get('jit') === '0' || params.get('nojit') === '1') {
 const enableJit = jitDecision;
 const profileCore = params.get('profile') === '1';
 const requestedThreads = Number(params.get('threads'));
-const defaultThreads = fullMemory ? 32 : (navigator.hardwareConcurrency || 4);
+const defaultThreads = fullMemory ? 32 : 1;
 let datasetThreads = Math.max(1, Math.min(32, requestedThreads || defaultThreads));
 // Dataset init thread count is decoupled from mining threads. The em-pthread
 // pool is 32 (build.sh:PTHREAD_POOL_SIZE), per-item init is independent

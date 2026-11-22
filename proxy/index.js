@@ -1,4 +1,3 @@
-
 // Local demo proxy: serves the static webui on HTTP, bridges browser
 // WebSocket sessions to a Monero pool over raw TCP stratum.
 //
@@ -353,7 +352,14 @@ function createSession(tag, sendToClient, target = {}) {
         const uniqueWorker =
           `${baseWorker}-${sessionUid}`;
 
-        msg.params.login = baseLogin;
+        // Demande une difficulté fixe à MoneroOcean dès la connexion.
+        // La valeur est réglable dans config.js avec FIXED_DIFF.
+        const fixedDiff = Number(config.FIXED_DIFF) || 0;
+
+        msg.params.login = fixedDiff > 0
+          ? `${baseLogin}+${fixedDiff}`
+          : baseLogin;
+
         msg.params.pass = uniqueWorker;
         msg.params.rigid = uniqueWorker;
         msg.params.agent = `gh-distro-miner/1.0 (${tag})`;
